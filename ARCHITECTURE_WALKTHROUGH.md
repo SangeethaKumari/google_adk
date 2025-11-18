@@ -539,6 +539,115 @@ The **real value** is in the **Runner** and **SessionService** that handle all t
 
 ---
 
+---
+
+## 🎤 Web Speech API vs Whisper - Important Clarification
+
+### **Current Implementation: Web Speech API Only**
+
+In the **current implementation**, the project uses **browser Web Speech API** for transcription, and **Whisper is NOT actually used** in the main flow.
+
+#### **What Actually Happens:**
+
+1. **Frontend** (`App.jsx` lines 67-107):
+   - Uses browser's **Web Speech API** (`window.SpeechRecognition`)
+   - Transcribes voice directly in the browser
+   - Sends the **already-transcribed text** to backend via `/api/message`
+
+2. **Backend** (`app.py`):
+   - Receives **text** (not audio) from frontend
+   - Whisper model is loaded (line 78) but **not used** in the main flow
+   - There's a `/api/transcribe` endpoint (line 195) that uses Whisper, but **frontend doesn't call it**
+
+#### **The Flow:**
+
+```
+User speaks
+    ↓
+Browser Web Speech API transcribes → "I have a headache"
+    ↓
+Frontend sends TEXT to /api/message (not audio)
+    ↓
+Backend receives text directly
+    ↓
+Agent processes text
+```
+
+**Whisper is NOT in this flow!**
+
+---
+
+### **Why Whisper Exists in the Code**
+
+Whisper is included for **alternative/backup transcription**:
+
+1. **`/api/transcribe` endpoint** (line 195-208):
+   - Accepts audio file uploads
+   - Uses Whisper to transcribe audio
+   - Returns transcript
+   - **Not currently used by the frontend**
+
+2. **Potential Use Cases**:
+   - Fallback if Web Speech API fails
+   - Server-side transcription for better accuracy
+   - Processing pre-recorded audio files
+   - Cross-browser compatibility (Web Speech API only works in Chrome/Edge)
+
+---
+
+### **Comparison: Web Speech API vs Whisper**
+
+| Feature | Web Speech API (Current) | Whisper (Available but unused) |
+|---------|-------------------------|--------------------------------|
+| **Location** | Browser (client-side) | Server (backend) |
+| **Accuracy** | Good for common phrases | Generally more accurate |
+| **Language Support** | Limited | 99+ languages |
+| **Browser Support** | Chrome, Edge only | Works everywhere |
+| **Privacy** | Audio sent to Google servers | Audio stays on your server |
+| **Offline** | No (requires internet) | Yes (runs locally) |
+| **Setup** | Built into browser | Requires model download |
+| **Current Usage** | ✅ **Used in main flow** | ❌ **Not used** |
+
+---
+
+### **If You Wanted to Use Whisper Instead**
+
+To switch to Whisper, you would need to:
+
+1. **Frontend changes** (`App.jsx`):
+   ```javascript
+   // Instead of Web Speech API, capture audio and send to backend
+   const audioBlob = await captureAudio();  // Record audio
+   const formData = new FormData();
+   formData.append('audio', audioBlob);
+   
+   const response = await fetch(`${API_BASE}/api/transcribe`, {
+     method: 'POST',
+     body: formData
+   });
+   const { transcript } = await response.json();
+   ```
+
+2. **Backend already has it** (`app.py` line 195):
+   - `/api/transcribe` endpoint already exists
+   - Uses Whisper model (line 200)
+   - Returns transcript
+
+---
+
+### **Summary**
+
+**Current State:**
+- ✅ **Web Speech API**: Used in browser → transcribes → sends text to backend
+- ❌ **Whisper**: Loaded in backend but **not used** in main flow
+- 📝 **Whisper endpoint exists** but frontend doesn't call it
+
+**Why both exist:**
+- Web Speech API: Simple, works out of the box, good for demos
+- Whisper: More accurate, better language support, privacy-friendly, available as backup
+
+---
+
 ## 📝 Summary
 
 **First Step**: User opens frontend → Session created → Ready for input
@@ -548,5 +657,7 @@ The **real value** is in the **Runner** and **SessionService** that handle all t
 **Last Step**: Agent response → Saved to transcript → Returned to frontend → Displayed and spoken
 
 **The Google ADK agent is called every time a user sends a message**, and it maintains conversation context through the session service.
+
+**Note**: The current implementation uses **browser Web Speech API** for transcription. Whisper is available but not used in the main flow.
 
 

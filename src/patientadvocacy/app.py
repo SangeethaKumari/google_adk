@@ -265,6 +265,169 @@ async def session_history(user_id: str, session_id: str) -> TranscriptResponse:
     return TranscriptResponse(session_id=session_id, history=history)
 
 
+class AllMessagesResponse(BaseModel):
+    total_sessions: int
+    total_user_messages: int
+    all_user_messages: List[dict]
+    combined_text: str
+
+
+@app.get("/api/all-messages", response_model=AllMessagesResponse)
+async def get_all_messages() -> AllMessagesResponse:
+    """
+    Retrieve all voice-to-text user messages from all conversations.
+    Reads from transcript files and active sessions.
+    """
+    all_user_messages: List[dict] = []
+    
+    # 1. Read from transcript files
+    if TRANSCRIPTS_DIR.exists():
+        for transcript_file in sorted(TRANSCRIPTS_DIR.glob("*.txt")):
+            try:
+                # Extract session_id from filename (format: session_xxx_timestamp.txt)
+                # Find the last underscore before the timestamp (which starts with a date)
+                filename_parts = transcript_file.stem.split("_")
+                # Session ID is everything before the last part (which is the timestamp)
+                # Timestamp format: YYYYMMDDTHHMMSS...Z
+                session_id_parts = []
+                for part in filename_parts:
+                    # If part looks like a timestamp (starts with digits and has T), stop
+                    if part and part[0].isdigit() and "T" in part:
+                        break
+                    session_id_parts.append(part)
+                session_id = "_".join(session_id_parts) if session_id_parts else transcript_file.stem
+                
+                with transcript_file.open("r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        if line.strip().startswith("[") and "USER:" in line:
+                            # Extract timestamp and message
+                            parts = line.split("USER:", 1)
+                            if len(parts) == 2:
+                                timestamp_part = parts[0].strip()
+                                message_text = parts[1].strip()
+                                all_user_messages.append({
+                                    "session_id": session_id,
+                                    "message": message_text,
+                                    "timestamp": timestamp_part,
+                                    "source": "transcript_file"
+                                })
+            except Exception as e:
+                print(f"Error reading transcript file {transcript_file}: {e}")
+    
+    # 2. Also get from active sessions (if available)
+    # Note: InMemorySessionService doesn't have a method to list all sessions,
+    # so we use the created_sessions set to track them
+    for user_id, session_id in created_sessions:
+        try:
+            session = await session_service.get_session_or_none(
+                app_name=APP_NAME, user_id=user_id, session_id=session_id
+            )
+            if session:
+                for message in session.messages:
+                    if message.role == "user":
+                        part_texts = []
+                        for part in message.parts or []:
+                            if getattr(part, "text", None) and not part.text.startswith("The attached image"):
+                                part_texts.append(part.text)
+                        if part_texts:
+                            all_user_messages.append({
+                                "session_id": session_id,
+                                "message": " ".join(part_texts),
+                                "timestamp": "active_session",
+                                "source": "active_session"
+                            })
+        except Exception as e:
+            print(f"Error reading session {session_id}: {e}")
+    
+    # Get unique sessions
+    unique_sessions = set(msg["session_id"] for msg in all_user_messages)
+    
+    # Combine all messages into one text
+    combined_text = "\n".join([f"[{msg['session_id']}] {msg['message']}" for msg in all_user_messages])
+    
+    # Print to console
+    print("\n" + "="*80)
+    print("ALL VOICE-TO-TEXT MESSAGES FROM ALL CONVERSATIONS")
+    print("="*80)
+    print(f"Total Sessions: {len(unique_sessions)}")
+    print(f"Total User Messages: {len(all_user_messages)}")
+    print("-"*80)
+    for msg in all_user_messages:
+        print(f"Session: {msg['session_id']}")
+        print(f"Message: {msg['message']}")
+        print(f"Timestamp: {msg['timestamp']}")
+        print("-"*80)
+    print("="*80 + "\n")
+    
+    return AllMessagesResponse(
+        total_sessions=len(unique_sessions),
+        total_user_messages=len(all_user_messages),
+        all_user_messages=all_user_messages,
+        combined_text=combined_text
+    )
+
+
+class AllImagesResponse(BaseModel):
+    total_images: int
+    images: List[dict]
+
+
+@app.get("/api/all-images", response_model=AllImagesResponse)
+async def get_all_images() -> AllImagesResponse:
+    """
+    List all images saved in the images directory.
+    """
+    images: List[dict] = []
+    
+    if IMAGES_DIR.exists():
+        for image_file in sorted(IMAGES_DIR.glob("*.png")):
+            try:
+                # Extract session_id from filename (format: session_xxx_timestamp.png)
+                # Find the last underscore before the timestamp (which starts with a date)
+                filename_parts = image_file.stem.split("_")
+                # Session ID is everything before the last part (which is the timestamp)
+                session_id_parts = []
+                for part in filename_parts:
+                    # If part looks like a timestamp (starts with digits and has T), stop
+                    if part and part[0].isdigit() and "T" in part:
+                        break
+                    session_id_parts.append(part)
+                session_id = "_".join(session_id_parts) if session_id_parts else image_file.stem
+                timestamp = filename_parts[-1] if len(filename_parts) > len(session_id_parts) else "unknown"
+                
+                file_size = image_file.stat().st_size
+                images.append({
+                    "session_id": session_id,
+                    "filename": image_file.name,
+                    "file_path": str(image_file),
+                    "timestamp": timestamp,
+                    "size_bytes": file_size,
+                    "size_kb": round(file_size / 1024, 2)
+                })
+            except Exception as e:
+                print(f"Error reading image file {image_file}: {e}")
+    
+    # Print to console
+    print("\n" + "="*80)
+    print("ALL IMAGES SAVED IN DIRECTORY")
+    print("="*80)
+    print(f"Total Images: {len(images)}")
+    print("-"*80)
+    for img in images:
+        print(f"Session: {img['session_id']}")
+        print(f"Filename: {img['filename']}")
+        print(f"Path: {img['file_path']}")
+        print(f"Size: {img['size_kb']} KB")
+        print("-"*80)
+    print("="*80 + "\n")
+    
+    return AllImagesResponse(
+        total_images=len(images),
+        images=images
+    )
+
+
 def run() -> None:
     import uvicorn
 
