@@ -29,6 +29,8 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [capturedImages, setCapturedImages] = useState([]);
   const [imagePreview, setImagePreview] = useState(null);
+  const [sessionSummary, setSessionSummary] = useState(null);
+  const [showSummary, setShowSummary] = useState(false);
 
   const videoRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -201,6 +203,36 @@ export default function App() {
     }
   }
 
+  async function handleEndConversation() {
+    setStatus("Generating session summary...");
+    try {
+      console.log(`${API_BASE}/api/session/${sessionId}/summary`);
+      const response = await fetch(`${API_BASE}/api/session/${sessionId}/summary`);
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody.detail || "Failed to get session summary");
+      }
+      const summary = await response.json();
+      setSessionSummary(summary);
+      setShowSummary(true);
+      setStatus("Session summary ready");
+      
+      // Download combined text as file
+      const blob = new Blob([summary.combined_text], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `conversation_${sessionId}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error(error);
+      setStatus(`Failed to get session summary: ${error.message}`);
+    }
+  }
+
   return (
     <div className="app">
       <header>
@@ -216,6 +248,9 @@ export default function App() {
           {isListening ? "Stop Listening" : "Start Voice"}
         </button>
         <button onClick={handleCapture}>Capture Snapshot</button>
+        <button onClick={handleEndConversation} style={{ backgroundColor: '#dc3545', color: 'white' }}>
+          End Conversation
+        </button>
       </section>
 
       <section className="camera">
@@ -245,6 +280,57 @@ export default function App() {
           ))}
         </ul>
       </section>
+
+      {showSummary && sessionSummary && (
+        <section className="session-summary" style={{ marginTop: '2rem', padding: '1rem', border: '2px solid #007bff', borderRadius: '8px' }}>
+          <h2>Session Summary</h2>
+          <p><strong>Session ID:</strong> {sessionSummary.session_id}</p>
+          <p><strong>Total Messages:</strong> {sessionSummary.total_messages}</p>
+          <p><strong>Total Images:</strong> {sessionSummary.total_images}</p>
+          
+          <div style={{ marginTop: '1rem' }}>
+            <h3>Combined Text:</h3>
+            <pre style={{ 
+              backgroundColor: '#f5f5f5', 
+              padding: '1rem', 
+              borderRadius: '4px',
+              overflow: 'auto',
+              maxHeight: '300px',
+              whiteSpace: 'pre-wrap'
+            }}>
+              {sessionSummary.combined_text}
+            </pre>
+          </div>
+
+          {sessionSummary.images && sessionSummary.images.length > 0 && (
+            <div style={{ marginTop: '1rem' }}>
+              <h3>Captured Images ({sessionSummary.images.length}):</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '1rem', marginTop: '1rem' }}>
+                {sessionSummary.images.map((img, idx) => (
+                  <div key={idx} style={{ border: '1px solid #ddd', borderRadius: '4px', padding: '0.5rem' }}>
+                    <img 
+                      src={img.base64} 
+                      alt={img.filename}
+                      style={{ width: '100%', height: 'auto', borderRadius: '4px' }}
+                    />
+                    <p style={{ fontSize: '0.8rem', marginTop: '0.5rem' }}>
+                      <strong>{img.filename}</strong><br />
+                      {img.size_kb} KB
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button 
+            onClick={() => setShowSummary(false)} 
+            style={{ marginTop: '1rem', padding: '0.5rem 1rem' }}
+          >
+            Close Summary
+          </button>
+        </section>
+      )}
     </div>
   );
 }

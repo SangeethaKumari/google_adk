@@ -56,6 +56,27 @@ class TranscriptResponse(BaseModel):
     history: List[dict]
 
 
+class AllMessagesResponse(BaseModel):
+    total_sessions: int
+    total_user_messages: int
+    all_user_messages: List[dict]
+    combined_text: str
+
+
+class AllImagesResponse(BaseModel):
+    total_images: int
+    images: List[dict]
+
+
+class SessionSummaryResponse(BaseModel):
+    session_id: str
+    total_messages: int
+    all_messages: List[dict]
+    combined_text: str
+    total_images: int
+    images: List[dict]
+
+
 def ensure_directories() -> None:
     for directory in (TRANSCRIPTS_DIR, IMAGES_DIR, AUDIO_DIR):
         directory.mkdir(parents=True, exist_ok=True)
@@ -240,36 +261,515 @@ async def message_endpoint(request: MessageRequest) -> MessageResponse:
     )
     return MessageResponse(reply=agent_reply, transcript_file=str(transcript_path))
 
+@app.get("/api/session/{session_id}/summary", response_model=SessionSummaryResponse)
+async def get_session_summary(session_id: str) -> SessionSummaryResponse:
+    """
+    Get all messages and images for a specific session.
+    - The API response contains all messages.
+    - Only user messages are saved to the conversation_summary file.
+    - UI can display only user messages using combined_user_text.
+    """
+    try:
+        all_messages: List[dict] = []
+        session_images: List[dict] = []
+
+        print(f"\n[DEBUG] Looking for session: {session_id}")
+        print(f"[DEBUG] Transcripts directory: {TRANSCRIPTS_DIR}")
+        print(f"[DEBUG] Images directory: {IMAGES_DIR}")
+
+        # --- 1. Load messages from transcript files ---
+        if TRANSCRIPTS_DIR.exists():
+            matching_files = list(TRANSCRIPTS_DIR.glob(f"{session_id}_*.txt"))
+            print(f"[DEBUG] Found {len(matching_files)} transcript files for session {session_id}")
+
+            for transcript_file in sorted(matching_files):
+                try:
+                    with transcript_file.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip().startswith("["):
+                                if "USER:" in line:
+                                    parts = line.split("USER:", 1)
+                                    if len(parts) == 2:
+                                        timestamp = parts[0].strip()
+                                        message = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "user",
+                                            "message": message,
+                                            "timestamp": timestamp,
+                                            "source": "transcript_file"
+                                        })
+                                elif "ASSISTANT:" in line:
+                                    parts = line.split("ASSISTANT:", 1)
+                                    if len(parts) == 2:
+                                        timestamp = parts[0].strip()
+                                        message = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "assistant",
+                                            "message": message,
+                                            "timestamp": timestamp,
+                                            "source": "transcript_file"
+                                        })
+                except Exception as e:
+                    print(f"[ERROR] Reading transcript {transcript_file}: {e}")
+
+        # --- 2. Load messages from active session ---
+        for user_id, sess_id in created_sessions:
+            if sess_id == session_id:
+                try:
+                    session = session_service.get_session_sync(
+                        app_name=APP_NAME, user_id=user_id, session_id=session_id
+                    )
+                    if session and hasattr(session, 'messages') and session.messages:
+                        for message in session.messages:
+                            parts_text = []
+                            for part in message.parts or []:
+                                text = getattr(part, "text", "")
+                                if text and not text.startswith("The attached image"):
+                                    parts_text.append(text)
+                            if parts_text:
+                                role = message.role.lower()
+                                all_messages.append({
+                                    "role": role,
+                                    "message": " ".join(parts_text),
+                                    "timestamp": "active_session",
+                                    "source": "active_session"
+                                })
+                except Exception as e:
+                    print(f"[ERROR] Reading active session {session_id}: {e}")
+
+        # --- 3. Combine only user messages into a single string ---
+        user_messages = [msg["message"] for msg in all_messages if msg.get("role") == "user"]
+        combined_user_text = " ".join(user_messages)
+
+        # --- 4. Save user conversation to summary file ---
+        summary_file = TRANSCRIPTS_DIR / f"{session_id}_conversation_summary.txt"
+        with summary_file.open("w", encoding="utf-8") as f:  # overwrite each time
+            f.write(combined_user_text)
+        print(f"[DEBUG] Saved user conversation to {summary_file}")
+
+        # --- 5. Load images for session ---
+        if IMAGES_DIR.exists():
+            matching_images = list(IMAGES_DIR.glob(f"{session_id}_*.png"))
+            for image_file in sorted(matching_images):
+                try:
+                    image_bytes = image_file.read_bytes()
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    file_size = image_file.stat().st_size
+                    timestamp = image_file.stem.split("_")[-1] if "_" in image_file.stem else "unknown"
+                    session_images.append({
+                        "filename": image_file.name,
+                        "file_path": str(image_file),
+                        "timestamp": timestamp,
+                        "size_bytes": file_size,
+                        "size_kb": round(file_size / 1024, 2),
+                        "base64": f"data:image/png;base64,{image_base64}"
+                    })
+                except Exception as e:
+                    print(f"[ERROR] Reading image {image_file}: {e}")
+
+        # --- 6. Combine all messages for API response (full conversation) ---
+        combined_text = "\n".join(
+            f"[{msg.get('timestamp', 'unknown')}] {msg.get('role', '').upper()}: {msg.get('message', '')}"
+            for msg in all_messages
+        ) if all_messages else "No messages found for this session."
+
+        print("\n" + "="*80)
+        print(f"USER CONVERSATION ONLY for session: {session_id}")
+        print("-"*80)
+        print(combined_user_text)  # for UI display, only user messages
+        print("="*80 + "\n")
+
+        if not all_messages and not session_images:
+            raise HTTPException(status_code=404, detail=f"No data found for session {session_id}")
+
+        return SessionSummaryResponse(
+            session_id=session_id,
+            total_messages=len(all_messages),
+            all_messages=all_messages,
+            #combined_text=combined_text,  # full conversation
+            combined_text=combined_user_text, #only user conversation
+            total_images=len(session_images),
+            images=session_images 
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] get_session_summary for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving session summary: {str(e)}")
+
+
+
+@app.get("/api/session/{session_id}/summary_old2", response_model=SessionSummaryResponse)
+async def get_session_summary(session_id: str) -> SessionSummaryResponse:
+    """
+    Get all messages and images for a specific session.
+    Only user messages are appended to the conversation_summary file.
+    """
+    try:
+        all_messages: List[dict] = []
+        session_images: List[dict] = []
+
+        print(f"\n[DEBUG] Looking for session: {session_id}")
+        print(f"[DEBUG] Transcripts directory: {TRANSCRIPTS_DIR}")
+        print(f"[DEBUG] Images directory: {IMAGES_DIR}")
+
+        # --- 1. Load messages from transcript files ---
+        if TRANSCRIPTS_DIR.exists():
+            matching_files = list(TRANSCRIPTS_DIR.glob(f"{session_id}_*.txt"))
+            print(f"[DEBUG] Found {len(matching_files)} transcript files for session {session_id}")
+
+            for transcript_file in sorted(matching_files):
+                try:
+                    with transcript_file.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip().startswith("["):
+                                if "USER:" in line:
+                                    parts = line.split("USER:", 1)
+                                    if len(parts) == 2:
+                                        timestamp = parts[0].strip()
+                                        message = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "user",
+                                            "message": message,
+                                            "timestamp": timestamp,
+                                            "source": "transcript_file"
+                                        })
+                                elif "ASSISTANT:" in line:
+                                    parts = line.split("ASSISTANT:", 1)
+                                    if len(parts) == 2:
+                                        timestamp = parts[0].strip()
+                                        message = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "assistant",
+                                            "message": message,
+                                            "timestamp": timestamp,
+                                            "source": "transcript_file"
+                                        })
+                except Exception as e:
+                    print(f"[ERROR] Reading transcript {transcript_file}: {e}")
+
+        # --- 2. Load messages from active session (if any) ---
+        for user_id, sess_id in created_sessions:
+            if sess_id == session_id:
+                try:
+                    session = session_service.get_session_sync(
+                        app_name=APP_NAME, user_id=user_id, session_id=session_id
+                    )
+                    if session and hasattr(session, 'messages') and session.messages:
+                        for message in session.messages:
+                            parts_text = []
+                            for part in message.parts or []:
+                                text = getattr(part, "text", "")
+                                if text and not text.startswith("The attached image"):
+                                    parts_text.append(text)
+                            if parts_text:
+                                role = message.role.lower()  # normalize role
+                                all_messages.append({
+                                    "role": role,
+                                    "message": " ".join(parts_text),
+                                    "timestamp": "active_session",
+                                    "source": "active_session"
+                                })
+                except Exception as e:
+                    print(f"[ERROR] Reading active session {session_id}: {e}")
+
+        # --- 3. Append only USER messages to conversation_summary ---
+        summary_file = TRANSCRIPTS_DIR / f"{session_id}_conversation_summary.txt"
+        user_messages = [msg for msg in all_messages if msg.get("role") == "user"]
+        if user_messages:
+            with summary_file.open("a", encoding="utf-8") as f:
+                for msg in user_messages:
+                    f.write(f"[{msg['timestamp']}] USER: {msg['message']}\n")
+            print(f"[DEBUG] Appended {len(user_messages)} user messages to {summary_file}")
+
+        # --- 4. Load images for session ---
+        if IMAGES_DIR.exists():
+            matching_images = list(IMAGES_DIR.glob(f"{session_id}_*.png"))
+            for image_file in sorted(matching_images):
+                try:
+                    image_bytes = image_file.read_bytes()
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    file_size = image_file.stat().st_size
+                    timestamp = image_file.stem.split("_")[-1] if "_" in image_file.stem else "unknown"
+                    session_images.append({
+                        "filename": image_file.name,
+                        "file_path": str(image_file),
+                        "timestamp": timestamp,
+                        "size_bytes": file_size,
+                        "size_kb": round(file_size / 1024, 2),
+                        "base64": f"data:image/png;base64,{image_base64}"
+                    })
+                except Exception as e:
+                    print(f"[ERROR] Reading image {image_file}: {e}")
+
+        # --- 5. Combine messages for API response ---
+        if all_messages:
+            combined_text = "\n".join(
+                f"[{msg.get('timestamp', 'unknown')}] {msg.get('role', '').upper()}: {msg.get('message', '')}"
+                for msg in all_messages
+            )
+        else:
+            combined_text = "No messages found for this session."
+
+        print("\n" + "="*80)
+        print(f"SESSION SUMMARY: {session_id}")
+        print("="*80)
+        print(f"Total Messages: {len(all_messages)}")
+        print(f"Total Images: {len(session_images)}")
+        print("-"*80)
+        print("Combined Text:")
+        print(combined_text)
+        print("-"*80)
+        print("Images:")
+        for img in session_images:
+            print(f"  - {img['filename']} ({img['size_kb']} KB)")
+        print("="*80 + "\n")
+
+        if not all_messages and not session_images:
+            raise HTTPException(status_code=404, detail=f"No data found for session {session_id}")
+
+        return SessionSummaryResponse(
+            session_id=session_id,
+            total_messages=len(all_messages),
+            all_messages=all_messages,
+            combined_text=combined_text,
+            total_images=len(session_images),
+            images=session_images
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] get_session_summary for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving session summary: {str(e)}")
+
+
+
+@app.get("/api/session/{session_id}/summary_old", response_model=SessionSummaryResponse)
+async def get_session_summary_old(session_id: str) -> SessionSummaryResponse:
+    """
+    Get all messages and images for a specific session.
+    Returns combined text and all images captured in that session.
+    IMPORTANT: This route must come BEFORE the /api/session/{user_id}/{session_id} route
+    to avoid path parameter conflicts in FastAPI routing.
+    """
+    try:
+        all_messages: List[dict] = []
+        session_images: List[dict] = []
+        
+        print(f"\n[DEBUG] Looking for session: {session_id}")
+        print(f"[DEBUG] Transcripts directory: {TRANSCRIPTS_DIR}")
+        print(f"[DEBUG] Images directory: {IMAGES_DIR}")
+        
+        # 1. Get messages from transcript files for this session
+        if TRANSCRIPTS_DIR.exists():
+            print(f"[DEBUG] Searching for transcript files matching: {session_id}_*.txt")
+            matching_files = list(TRANSCRIPTS_DIR.glob(f"{session_id}_*.txt"))
+            print(f"[DEBUG] Found {len(matching_files)} matching transcript files")
+            
+            for transcript_file in sorted(matching_files):
+                print(f"[DEBUG] Processing transcript: {transcript_file.name}")
+                try:
+                    with transcript_file.open("r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if line.strip().startswith("["):
+                                if "USER:" in line:
+                                    parts = line.split("USER:", 1)
+                                    if len(parts) == 2:
+                                        timestamp_part = parts[0].strip()
+                                        message_text = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "user",
+                                            "message": message_text,
+                                            "timestamp": timestamp_part,
+                                            "source": "transcript_file"
+                                        })
+                                elif "ASSISTANT:" in line:
+                                    parts = line.split("ASSISTANT:", 1)
+                                    if len(parts) == 2:
+                                        timestamp_part = parts[0].strip()
+                                        message_text = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "assistant",
+                                            "message": message_text,
+                                            "timestamp": timestamp_part,
+                                            "source": "transcript_file"
+                                        })
+                except Exception as e:
+                    print(f"[ERROR] Reading transcript file {transcript_file}: {e}")
+        else:
+            print(f"[DEBUG] Transcripts directory does not exist: {TRANSCRIPTS_DIR}")
+        
+        # 2. Also get from active session if available
+        for user_id, sess_id in created_sessions:
+            if sess_id == session_id:
+                print(f"[DEBUG] Found active session for user {user_id}")
+                try:
+                    session = session_service.get_session_sync(
+                        app_name=APP_NAME, user_id=user_id, session_id=session_id
+                    )
+                    if session and hasattr(session, 'messages') and session.messages:
+                        for message in session.messages:
+                            part_texts = []
+                            for part in message.parts or []:
+                                if getattr(part, "text", None) and not part.text.startswith("The attached image"):
+                                    part_texts.append(part.text)
+                            if part_texts:
+                                all_messages.append({
+                                    "role": message.role,
+                                    "message": " ".join(part_texts),
+                                    "timestamp": "active_session",
+                                    "source": "active_session"
+                                })
+                except Exception as e:
+                    print(f"[ERROR] Reading active session {session_id}: {e}")
+        
+        # 3. Get all images for this session
+        if IMAGES_DIR.exists():
+            print(f"[DEBUG] Searching for images matching: {session_id}_*.png")
+            matching_images = list(IMAGES_DIR.glob(f"{session_id}_*.png"))
+            print(f"[DEBUG] Found {len(matching_images)} matching images")
+            
+            for image_file in sorted(matching_images):
+                try:
+                    file_size = image_file.stat().st_size
+                    image_bytes = image_file.read_bytes()
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    # Extract timestamp from filename
+                    filename_parts = image_file.stem.split("_")
+                    timestamp = filename_parts[-1] if len(filename_parts) > 1 else "unknown"
+                    
+                    session_images.append({
+                        "filename": image_file.name,
+                        "file_path": str(image_file),
+                        "timestamp": timestamp,
+                        "size_bytes": file_size,
+                        "size_kb": round(file_size / 1024, 2),
+                        "base64": f"data:image/png;base64,{image_base64}"
+                    })
+                except Exception as e:
+                    print(f"[ERROR] Reading image file {image_file}: {e}")
+        else:
+            print(f"[DEBUG] Images directory does not exist: {IMAGES_DIR}")
+        
+        # 4. Combine all messages into text
+        if all_messages:
+            combined_text = "\n".join([
+                f"[{msg.get('timestamp', 'unknown')}] {msg.get('role', 'unknown').upper()}: {msg.get('message', '')}"
+                for msg in all_messages
+            ])
+        else:
+            combined_text = "No messages found for this session."
+        
+        print("\n" + "="*80)
+        print(f"SESSION SUMMARY: {session_id}")
+        print("="*80)
+        print(f"Total Messages: {len(all_messages)}")
+        print(f"Total Images: {len(session_images)}")
+        print("-"*80)
+        print("Combined Text:")
+        print(combined_text)
+        print("-"*80)
+        print("Images:")
+        for img in session_images:
+            print(f"  - {img['filename']} ({img['size_kb']} KB)")
+        print("="*80 + "\n")
+        
+        if not all_messages and not session_images:
+            print(f"[WARNING] No messages or images found for session: {session_id}")
+            raise HTTPException(status_code=404, detail=f"No data found for session {session_id}")
+        
+        return SessionSummaryResponse(
+            session_id=session_id,
+            total_messages=len(all_messages),
+            all_messages=all_messages,
+            combined_text=combined_text,
+            total_images=len(session_images),
+            images=session_images
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] get_session_summary for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving session summary: {str(e)}")
+
 
 @app.get("/api/session/{user_id}/{session_id}", response_model=TranscriptResponse)
 async def session_history(user_id: str, session_id: str) -> TranscriptResponse:
-    session = await session_service.get_session_or_none(
-        app_name=APP_NAME, user_id=user_id, session_id=session_id
-    )
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
+    """
+    Get session history from transcript files and active sessions.
+    Falls back to transcript files if session is not in memory.
+    """
     history: List[dict] = []
-    for message in session.messages:
-        part_texts = []
-        for part in message.parts or []:
-            if getattr(part, "text", None):
-                part_texts.append(part.text)
-        history.append(
-            {
-                "role": message.role,
-                "text": " ".join(part_texts),
-            }
+    
+    # First, try to get from active session
+    session = None
+    try:
+        session = session_service.get_session_sync(
+            app_name=APP_NAME, user_id=user_id, session_id=session_id
         )
-
+    except Exception as e:
+        print(f"Error retrieving active session: {e}")
+    
+    # If session exists in memory, use it
+    if session is not None and hasattr(session, 'messages') and session.messages:
+        for message in session.messages:
+            part_texts = []
+            for part in message.parts or []:
+                if getattr(part, "text", None):
+                    part_texts.append(part.text)
+            if part_texts:
+                history.append(
+                    {
+                        "role": message.role,
+                        "text": " ".join(part_texts),
+                    }
+                )
+        return TranscriptResponse(session_id=session_id, history=history)
+    
+    # Fall back to transcript files if session not in memory
+    print(f"Session not in memory, reading from transcript files for session_id: {session_id}")
+    if TRANSCRIPTS_DIR.exists():
+        for transcript_file in sorted(TRANSCRIPTS_DIR.glob(f"{session_id}_*.txt")):
+            print(f"Found transcript file: {transcript_file}")
+            try:
+                with transcript_file.open("r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        if line.strip().startswith("["):
+                            if "USER:" in line:
+                                parts = line.split("USER:", 1)
+                                if len(parts) == 2:
+                                    message_text = parts[1].strip()
+                                    history.append({
+                                        "role": "user",
+                                        "text": message_text,
+                                    })
+                            elif "ASSISTANT:" in line:
+                                parts = line.split("ASSISTANT:", 1)
+                                if len(parts) == 2:
+                                    message_text = parts[1].strip()
+                                    history.append({
+                                        "role": "assistant",
+                                        "text": message_text,
+                                    })
+            except Exception as e:
+                print(f"Error reading transcript file {transcript_file}: {e}")
+    
+    if not history:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found in memory or transcripts")
+    
+    print(f"Found {len(history)} messages for session {session_id}")
     return TranscriptResponse(session_id=session_id, history=history)
-
-
-class AllMessagesResponse(BaseModel):
-    total_sessions: int
-    total_user_messages: int
-    all_user_messages: List[dict]
-    combined_text: str
 
 
 @app.get("/api/all-messages", response_model=AllMessagesResponse)
@@ -284,14 +784,9 @@ async def get_all_messages() -> AllMessagesResponse:
     if TRANSCRIPTS_DIR.exists():
         for transcript_file in sorted(TRANSCRIPTS_DIR.glob("*.txt")):
             try:
-                # Extract session_id from filename (format: session_xxx_timestamp.txt)
-                # Find the last underscore before the timestamp (which starts with a date)
                 filename_parts = transcript_file.stem.split("_")
-                # Session ID is everything before the last part (which is the timestamp)
-                # Timestamp format: YYYYMMDDTHHMMSS...Z
                 session_id_parts = []
                 for part in filename_parts:
-                    # If part looks like a timestamp (starts with digits and has T), stop
                     if part and part[0].isdigit() and "T" in part:
                         break
                     session_id_parts.append(part)
@@ -301,7 +796,6 @@ async def get_all_messages() -> AllMessagesResponse:
                     lines = f.readlines()
                     for line in lines:
                         if line.strip().startswith("[") and "USER:" in line:
-                            # Extract timestamp and message
                             parts = line.split("USER:", 1)
                             if len(parts) == 2:
                                 timestamp_part = parts[0].strip()
@@ -315,15 +809,13 @@ async def get_all_messages() -> AllMessagesResponse:
             except Exception as e:
                 print(f"Error reading transcript file {transcript_file}: {e}")
     
-    # 2. Also get from active sessions (if available)
-    # Note: InMemorySessionService doesn't have a method to list all sessions,
-    # so we use the created_sessions set to track them
+    # 2. Also get from active sessions
     for user_id, session_id in created_sessions:
         try:
-            session = await session_service.get_session_or_none(
+            session = session_service.get_session_sync(
                 app_name=APP_NAME, user_id=user_id, session_id=session_id
             )
-            if session:
+            if session and session.messages:
                 for message in session.messages:
                     if message.role == "user":
                         part_texts = []
@@ -340,13 +832,9 @@ async def get_all_messages() -> AllMessagesResponse:
         except Exception as e:
             print(f"Error reading session {session_id}: {e}")
     
-    # Get unique sessions
     unique_sessions = set(msg["session_id"] for msg in all_user_messages)
-    
-    # Combine all messages into one text
     combined_text = "\n".join([f"[{msg['session_id']}] {msg['message']}" for msg in all_user_messages])
     
-    # Print to console
     print("\n" + "="*80)
     print("ALL VOICE-TO-TEXT MESSAGES FROM ALL CONVERSATIONS")
     print("="*80)
@@ -373,6 +861,15 @@ class AllImagesResponse(BaseModel):
     images: List[dict]
 
 
+class SessionSummaryResponse(BaseModel):
+    session_id: str
+    total_messages: int
+    all_messages: List[dict]
+    combined_text: str
+    total_images: int
+    images: List[dict]
+
+
 @app.get("/api/all-images", response_model=AllImagesResponse)
 async def get_all_images() -> AllImagesResponse:
     """
@@ -383,13 +880,9 @@ async def get_all_images() -> AllImagesResponse:
     if IMAGES_DIR.exists():
         for image_file in sorted(IMAGES_DIR.glob("*.png")):
             try:
-                # Extract session_id from filename (format: session_xxx_timestamp.png)
-                # Find the last underscore before the timestamp (which starts with a date)
                 filename_parts = image_file.stem.split("_")
-                # Session ID is everything before the last part (which is the timestamp)
                 session_id_parts = []
                 for part in filename_parts:
-                    # If part looks like a timestamp (starts with digits and has T), stop
                     if part and part[0].isdigit() and "T" in part:
                         break
                     session_id_parts.append(part)
@@ -408,7 +901,6 @@ async def get_all_images() -> AllImagesResponse:
             except Exception as e:
                 print(f"Error reading image file {image_file}: {e}")
     
-    # Print to console
     print("\n" + "="*80)
     print("ALL IMAGES SAVED IN DIRECTORY")
     print("="*80)
@@ -428,6 +920,157 @@ async def get_all_images() -> AllImagesResponse:
     )
 
 
+@app.get("/api/session/{session_id}/summary", response_model=SessionSummaryResponse)
+async def get_session_summary(session_id: str) -> SessionSummaryResponse:
+    """
+    Get all messages and images for a specific session.
+    Returns combined text and all images captured in that session.
+    """
+    try:
+        all_messages: List[dict] = []
+        session_images: List[dict] = []
+        
+        print(f"\n[DEBUG] Looking for session: {session_id}")
+        print(f"[DEBUG] Transcripts directory: {TRANSCRIPTS_DIR}")
+        print(f"[DEBUG] Images directory: {IMAGES_DIR}")
+        
+        # 1. Get messages from transcript files for this session
+        if TRANSCRIPTS_DIR.exists():
+            print(f"[DEBUG] Searching for transcript files matching: {session_id}_*.txt")
+            matching_files = list(TRANSCRIPTS_DIR.glob(f"{session_id}_*.txt"))
+            print(f"[DEBUG] Found {len(matching_files)} matching transcript files")
+            
+            for transcript_file in sorted(matching_files):
+                print(f"[DEBUG] Processing transcript: {transcript_file.name}")
+                try:
+                    with transcript_file.open("r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if line.strip().startswith("["):
+                                if "USER:" in line:
+                                    parts = line.split("USER:", 1)
+                                    if len(parts) == 2:
+                                        timestamp_part = parts[0].strip()
+                                        message_text = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "user",
+                                            "message": message_text,
+                                            "timestamp": timestamp_part,
+                                            "source": "transcript_file"
+                                        })
+                                elif "ASSISTANT:" in line:
+                                    parts = line.split("ASSISTANT:", 1)
+                                    if len(parts) == 2:
+                                        timestamp_part = parts[0].strip()
+                                        message_text = parts[1].strip()
+                                        all_messages.append({
+                                            "role": "assistant",
+                                            "message": message_text,
+                                            "timestamp": timestamp_part,
+                                            "source": "transcript_file"
+                                        })
+                except Exception as e:
+                    print(f"[ERROR] Reading transcript file {transcript_file}: {e}")
+        else:
+            print(f"[DEBUG] Transcripts directory does not exist: {TRANSCRIPTS_DIR}")
+        
+        # 2. Also get from active session if available
+        for user_id, sess_id in created_sessions:
+            if sess_id == session_id:
+                print(f"[DEBUG] Found active session for user {user_id}")
+                try:
+                    session = session_service.get_session_sync(
+                        app_name=APP_NAME, user_id=user_id, session_id=session_id
+                    )
+                    if session and hasattr(session, 'messages') and session.messages:
+                        for message in session.messages:
+                            part_texts = []
+                            for part in message.parts or []:
+                                if getattr(part, "text", None) and not part.text.startswith("The attached image"):
+                                    part_texts.append(part.text)
+                            if part_texts:
+                                all_messages.append({
+                                    "role": message.role,
+                                    "message": " ".join(part_texts),
+                                    "timestamp": "active_session",
+                                    "source": "active_session"
+                                })
+                except Exception as e:
+                    print(f"[ERROR] Reading active session {session_id}: {e}")
+        
+        # 3. Get all images for this session
+        if IMAGES_DIR.exists():
+            print(f"[DEBUG] Searching for images matching: {session_id}_*.png")
+            matching_images = list(IMAGES_DIR.glob(f"{session_id}_*.png"))
+            print(f"[DEBUG] Found {len(matching_images)} matching images")
+            
+            for image_file in sorted(matching_images):
+                try:
+                    file_size = image_file.stat().st_size
+                    image_bytes = image_file.read_bytes()
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    # Extract timestamp from filename
+                    filename_parts = image_file.stem.split("_")
+                    timestamp = filename_parts[-1] if len(filename_parts) > 1 else "unknown"
+                    
+                    session_images.append({
+                        "filename": image_file.name,
+                        "file_path": str(image_file),
+                        "timestamp": timestamp,
+                        "size_bytes": file_size,
+                        "size_kb": round(file_size / 1024, 2),
+                        "base64": f"data:image/png;base64,{image_base64}"
+                    })
+                except Exception as e:
+                    print(f"[ERROR] Reading image file {image_file}: {e}")
+        else:
+            print(f"[DEBUG] Images directory does not exist: {IMAGES_DIR}")
+        
+        # 4. Combine all messages into text
+        if all_messages:
+            combined_text = "\n".join([
+                f"[{msg.get('timestamp', 'unknown')}] {msg.get('role', 'unknown').upper()}: {msg.get('message', '')}"
+                for msg in all_messages
+            ])
+        else:
+            combined_text = "No messages found for this session."
+        
+        print("\n" + "="*80)
+        print(f"SESSION SUMMARY: {session_id}")
+        print("="*80)
+        print(f"Total Messages: {len(all_messages)}")
+        print(f"Total Images: {len(session_images)}")
+        print("-"*80)
+        print("Combined Text:")
+        print(combined_text)
+        print("-"*80)
+        print("Images:")
+        for img in session_images:
+            print(f"  - {img['filename']} ({img['size_kb']} KB)")
+        print("="*80 + "\n")
+        
+        if not all_messages and not session_images:
+            print(f"[WARNING] No messages or images found for session: {session_id}")
+            raise HTTPException(status_code=404, detail=f"No data found for session {session_id}")
+        
+        return SessionSummaryResponse(
+            session_id=session_id,
+            total_messages=len(all_messages),
+            all_messages=all_messages,
+            combined_text=combined_text,
+            total_images=len(session_images),
+            images=session_images
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] get_session_summary for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving session summary: {str(e)}")
+
+
 def run() -> None:
     import uvicorn
 
@@ -441,4 +1084,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
