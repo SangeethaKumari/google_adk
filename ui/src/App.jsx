@@ -70,7 +70,7 @@ export default function App() {
     const recognition = new SpeechRecognition();
     recognition.lang = "en-US";
     recognition.interimResults = false;
-    recognition.continuous = false;
+    recognition.continuous = true;
 
     recognition.onstart = () => {
       setIsListening(true);
@@ -120,6 +120,10 @@ export default function App() {
     utterance.lang = "en-US";
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utterance);
+    // Stop speech recognition when speech starts and start it when speech ends
+    utterance.onstart = () => recognitionRef.current.stop();
+    utterance.onend = () => recognitionRef.current.start();
+
   }
 
   async function sendMessage(message) {
@@ -291,7 +295,8 @@ export default function App() {
           <div style={{ marginTop: '1rem' }}>
             <h3>Combined Text:</h3>
             <pre style={{ 
-              backgroundColor: '#f5f5f5', 
+              backgroundColor: 'black', 
+              color: 'white',
               padding: '1rem', 
               borderRadius: '4px',
               overflow: 'auto',
